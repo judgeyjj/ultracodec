@@ -1,0 +1,13 @@
+# Force LF line endings for all text files
+* text=auto eol=lf
+
+# Explicitly mark shell scripts as LF
+*.sh text eol=lf
+
+# Binary files
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.wav binary
+*.flac binary
+*.mp3 binary
