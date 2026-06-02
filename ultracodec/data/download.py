@@ -44,7 +44,7 @@ DNS_CHALLENGE_URLS = {
 # Generic helpers
 # ---------------------------------------------------------------------------
 def _download_url(url: str, dest: Path, chunk_size: int = 1 << 16) -> Path:
-    """Download ``url`` to ``dest``. Returns ``dest``."""
+    """Download ``url`` to ``dest`` with progress bar. Returns ``dest``."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         logger.info("File %s already exists; skipping download.", dest)
@@ -53,13 +53,42 @@ def _download_url(url: str, dest: Path, chunk_size: int = 1 << 16) -> Path:
     logger.info("Downloading %s -> %s", url, dest)
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
-        with urllib.request.urlopen(url) as response, open(tmp, "wb") as fh:
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk:
-                    break
-                fh.write(chunk)
+        req = urllib.request.Request(url, headers={"User-Agent": "UltraCodec/1.0"})
+        with urllib.request.urlopen(req) as response:
+            total_size = int(response.headers.get("Content-Length", 0))
+            downloaded = 0
+            # Try to use tqdm for progress bar
+            try:
+                from tqdm import tqdm
+                pbar = tqdm(total=total_size, unit="B", unit_scale=True,
+                           desc=dest.name, ncols=80)
+            except ImportError:
+                pbar = None
+
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if pbar is not None:
+                        pbar.update(len(chunk))
+                    elif total_size > 0 and downloaded % (10 * 1024 * 1024) < chunk_size:
+                        # Fallback: print progress every ~10MB
+                        pct = downloaded * 100 / total_size
+                        mb_done = downloaded / (1024 * 1024)
+                        mb_total = total_size / (1024 * 1024)
+                        print(f"\r  {dest.name}: {mb_done:.0f}/{mb_total:.0f} MB ({pct:.1f}%)",
+                              end="", flush=True)
+
+            if pbar is not None:
+                pbar.close()
+            elif total_size > 0:
+                print()  # newline after fallback progress
+
         shutil.move(str(tmp), str(dest))
+        logger.info("Download complete: %s", dest)
     except Exception:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
