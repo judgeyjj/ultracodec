@@ -1,0 +1,48 @@
+# Stage 2: LLM-aware fine-tuning (LoRA on codec encoder).
+defaults:
+  - base
+
+training:
+  stage: 2
+  description: "LLM-aware fine-tuning"
+  batch_size: 8
+  epochs: 50
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  scheduler: cosine_warmup
+  warmup_steps: 2000
+  gradient_clip: 1.0
+  accumulate_grad: 4
+  max_steps: 100000
+  precision: bf16
+  resume_from: runs/uc_stage1/best.pt
+
+  losses:
+    reconstruction_weight: 1.0
+    adversarial_weight: 1.0
+    codebook_weight: 0.25
+    prediction_weight: 0.5
+    semantic_weight: 1.0
+    rate_weight: 10.0
+    llm_weight: 0.1
+
+  afr:
+    enabled: true
+
+  llm:
+    name: Qwen/Qwen2-0.5B
+    use_lora: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+
+  checkpoint:
+    save_every: 2500
+    keep_last: 5
+    output_dir: runs/uc_stage2
+
+  logging:
+    log_every: 100
+    use_wandb: true
+    project: ultracodec
+    run_name: stage2

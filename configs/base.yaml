@@ -1,0 +1,77 @@
+# UltraCodec base configuration.
+# Other stage configs inherit from this via OmegaConf merge.
+
+model:
+  name: ultracodec
+  sample_rate: 16000
+  channels: 1
+
+  # SSL frontend
+  ssl:
+    name: wavlm-base
+    layer: 9
+    freeze: true
+    feat_dim: 768
+    feat_rate: 50  # Hz
+
+  # Hierarchical Temporal Compression Encoder
+  encoder:
+    input_channels: 1
+    hidden_dims: [64, 128, 256, 512]
+    downsample_ratios: [2, 2, 2, 2]   # 50 -> 25 -> 12.5 -> 6.25 -> 3.125 Hz
+    num_transformer_layers: 4
+    num_heads: 8
+    causal: true
+
+  # Semantic Predictive Quantizer
+  quantizer:
+    type: spq                           # semantic predictive quantization
+    codebook_size: 1024
+    codebook_dim: 128
+    num_codebooks: 8
+    commitment_weight: 0.25
+    prediction_order: 2
+    predictor_layers: 4
+    predictor_heads: 8
+
+  # Adaptive Frame Rate
+  afr:
+    enabled: true
+    min_frame_rate: 1.5625              # Hz
+    max_frame_rate: 6.25                # Hz
+    target_keep: 0.0625                 # 50 Hz * 0.0625 = 3.125 Hz
+    gumbel_temperature: 1.0
+    entropy_weight: 0.1
+
+  # Cascaded coarse-to-fine decoder
+  decoder:
+    hidden_dims: [512, 256, 128, 64]
+    upsample_ratios: [2, 2, 2, 2]
+    num_transformer_layers: 2
+
+data:
+  sample_rate: 16000
+  segment_length: 48000                 # 3 seconds
+  num_workers: 8
+
+  vctk:
+    root: /data01/audio_group/m24_yuanjiajun/AP-BWE/VCTK-Corpus-0.92/wav_test
+    splits: [train, train_test, test]
+
+  librispeech:
+    root: ./data/librispeech
+    download: true
+    train_splits: [train-clean-100, train-clean-360]
+    val_splits: [dev-clean]
+    test_splits: [test-clean]
+
+  augmentation:
+    enabled: false
+    musan_root: ./data/musan
+    dns_root: ./data/dns
+    add_noise_prob: 0.3
+    snr_range: [5, 25]
+    volume_perturb_prob: 0.5
+    volume_range: [0.5, 1.5]
+
+seed: 42

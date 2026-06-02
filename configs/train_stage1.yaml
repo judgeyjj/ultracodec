@@ -1,0 +1,40 @@
+# Stage 1: Pure codec pre-training (basic reconstruction).
+defaults:
+  - base
+
+training:
+  stage: 1
+  description: "Basic reconstruction training"
+  batch_size: 16
+  epochs: 100
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  scheduler: cosine_warmup
+  warmup_steps: 5000
+  gradient_clip: 1.0
+  accumulate_grad: 2
+  max_steps: 200000
+  precision: bf16
+
+  losses:
+    reconstruction_weight: 1.0
+    adversarial_weight: 0.0   # No adversarial in stage 1
+    codebook_weight: 1.0
+    prediction_weight: 0.5
+    semantic_weight: 1.0
+    rate_weight: 10.0
+    llm_weight: 0.0
+
+  afr:
+    enabled: false             # Disabled in stage 1
+
+  checkpoint:
+    save_every: 5000
+    keep_last: 5
+    output_dir: runs/uc_stage1
+
+  logging:
+    log_every: 100
+    use_wandb: true
+    project: ultracodec
+    run_name: stage1

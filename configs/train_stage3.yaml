@@ -1,0 +1,59 @@
+# Stage 3: Joint LoRA fine-tuning of codec + LLM.
+defaults:
+  - base
+
+training:
+  stage: 3
+  description: "Joint codec + LLM LoRA fine-tuning"
+  batch_size: 4
+  epochs: 20
+  learning_rate: 3.0e-5
+  weight_decay: 0.01
+  scheduler: cosine_warmup
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  accumulate_grad: 8
+  max_steps: 50000
+  precision: bf16
+  resume_from: runs/uc_stage2/best.pt
+
+  losses:
+    reconstruction_weight: 1.0
+    adversarial_weight: 1.0
+    codebook_weight: 0.25
+    prediction_weight: 0.5
+    semantic_weight: 1.0
+    rate_weight: 10.0
+    llm_weight: 0.5
+
+  afr:
+    enabled: true
+
+  llm:
+    name: Qwen/Qwen2-0.5B
+    use_lora: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    train_lora: true
+
+  codec:
+    use_lora: true
+    lora_r: 8
+    lora_alpha: 16
+
+  tasks:
+    - tts
+    - s2s
+    - instruction_following
+
+  checkpoint:
+    save_every: 2500
+    keep_last: 5
+    output_dir: runs/uc_stage3
+
+  logging:
+    log_every: 50
+    use_wandb: true
+    project: ultracodec
+    run_name: stage3

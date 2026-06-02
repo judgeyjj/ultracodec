@@ -1,0 +1,41 @@
+# Evaluation configuration.
+defaults:
+  - base
+
+evaluation:
+  checkpoint: runs/uc_stage3/best.pt
+  output_dir: runs/eval
+  batch_size: 8
+  num_workers: 4
+  precision: fp32
+
+  datasets:
+    - name: librispeech-test-clean
+      root: ./data/librispeech
+      split: test-clean
+    - name: vctk-test
+      root: /data01/audio_group/m24_yuanjiajun/AP-BWE/VCTK-Corpus-0.92/wav_test
+      split: test
+
+  metrics:
+    reconstruction:
+      - visqol
+      - utmos
+      - pesq
+      - stoi
+      - mcd
+    asr:
+      - wer
+      - cer
+    coding:
+      - frame_rate
+      - bitrate
+      - compression_ratio
+    llm:
+      - perplexity
+      - tts_wer
+      - secs
+
+  whisper_model: openai/whisper-large-v3
+  save_audio: false
+  save_audio_max: 32
