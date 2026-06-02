@@ -5,14 +5,14 @@ defaults:
 training:
   stage: 3
   description: "Joint codec + LLM LoRA fine-tuning"
-  batch_size: 4
+  batch_size: 8                # Single A100 42GB joint training
   epochs: 20
   learning_rate: 3.0e-5
   weight_decay: 0.01
   scheduler: cosine_warmup
   warmup_steps: 1000
   gradient_clip: 1.0
-  accumulate_grad: 8
+  accumulate_grad: 16           # effective batch = 8 * 16 = 128
   max_steps: 50000
   precision: bf16
   resume_from: runs/uc_stage2/best.pt

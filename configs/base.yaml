@@ -75,3 +75,9 @@ data:
     volume_range: [0.5, 1.5]
 
 seed: 42
+
+# Hardware
+hardware:
+  gpu_id: 2                                # CUDA device index
+  num_gpus: 1                              # Single GPU training
+  distributed: false

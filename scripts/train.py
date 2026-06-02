@@ -107,10 +107,12 @@ def is_main_process() -> bool:
     return get_rank() == 0
 
 
-def setup_distributed(backend: str = "nccl") -> Tuple[int, int, torch.device]:
+def setup_distributed(backend: str = "nccl", cfg=None) -> Tuple[int, int, torch.device]:
     """Initialise ``torch.distributed`` if running under ``torchrun``.
 
     Returns ``(rank, world_size, device)`` regardless of distributed mode.
+    If cfg contains hardware.gpu_id, sets CUDA_VISIBLE_DEVICES accordingly
+    (only in non-distributed single-GPU mode).
     """
     if is_dist_run():
         if not dist.is_initialized():
@@ -124,6 +126,12 @@ def setup_distributed(backend: str = "nccl") -> Tuple[int, int, torch.device]:
         else:
             device = torch.device("cpu")
         return rank, world_size, device
+    # Single-GPU mode: respect hardware.gpu_id from config
+    if cfg is not None and not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        gpu_id = cfg.get("hardware", {}).get("gpu_id", None)
+        if gpu_id is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            logging.info(f"Set CUDA_VISIBLE_DEVICES={gpu_id} from config")
     if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
@@ -436,7 +444,7 @@ def run_validation(
 
 def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
     """Main training entry."""
-    rank, world_size, device = setup_distributed()
+    rank, world_size, device = setup_distributed(cfg=cfg)
     set_seed(int(cfg.get("seed", 42)) + rank)
 
     if is_main_process():
