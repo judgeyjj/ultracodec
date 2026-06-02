@@ -54,7 +54,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -152,12 +152,20 @@ def load_config(path: str) -> DictConfig:
     """Load a YAML config and merge it with its ``defaults: [base]`` parents."""
     cfg = OmegaConf.load(path)
     parents = []
-    if isinstance(cfg.get("defaults", None), list):
+    defaults = cfg.get("defaults", None)
+    if defaults is not None:
         cfg_dir = Path(path).parent
-        for entry in cfg.pop("defaults"):
+        # OmegaConf ListConfig may not pass isinstance(..., list)
+        defaults_list = OmegaConf.to_container(defaults) if hasattr(defaults, '__iter__') and not isinstance(defaults, str) else []
+        # Remove defaults key from cfg before merge
+        with open_dict(cfg):
+            cfg.pop("defaults", None)
+        for entry in defaults_list:
             parent_path = cfg_dir / f"{entry}.yaml"
             if parent_path.exists():
                 parents.append(OmegaConf.load(parent_path))
+            else:
+                logging.warning(f"Default config not found: {parent_path}")
     merged = OmegaConf.merge(*parents, cfg) if parents else cfg
     OmegaConf.resolve(merged)
     return merged  # type: ignore[return-value]
