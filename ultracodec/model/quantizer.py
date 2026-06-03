@@ -143,19 +143,31 @@ class VectorQuantize(nn.Module):
         self.cluster_size[dead_mask] = mean_usage
         self.embed_avg.data[dead_mask] = new_codes * mean_usage
 
-    def _compute_diversity_loss(self) -> torch.Tensor:
-        """Compute diversity loss: encourages uniform codebook usage.
+    def _compute_diversity_loss(self, dists: torch.Tensor) -> torch.Tensor:
+        """Compute diversity loss with gradient flow.
 
-        Returns normalized negative entropy of code distribution.
-        diversity_loss = (max_entropy - entropy) / max_entropy in [0, 1].
+        Uses soft assignment probabilities from CURRENT BATCH distances
+        (not the EMA buffer which has no gradient). This allows the encoder
+        to receive gradients encouraging more uniform code usage.
+
+        Args:
+            dists: Distance matrix [B*T, K] from current batch.
+
+        Returns:
+            diversity_loss: Scalar, lower = more uniform usage.
         """
-        # Use cluster_size as proxy for code usage distribution
-        probs = self.cluster_size / (self.cluster_size.sum() + 1e-8)
-        # Clamp for numerical stability
-        probs = probs.clamp(min=1e-8)
-        entropy = -(probs * torch.log(probs)).sum()
+        # Soft assignment probabilities (gradient flows through here)
+        temperature = 1.0
+        soft_probs = F.softmax(-dists / temperature, dim=-1)  # [B*T, K]
+
+        # Average probability per code across batch
+        avg_probs = soft_probs.mean(dim=0)  # [K]
+
+        # Maximize entropy of avg_probs (= minimize negative entropy)
+        entropy = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
         max_entropy = math.log(self.codebook_size)
-        # Normalized so that 0 = perfect uniform, 1 = fully collapsed
+
+        # Normalized: 0 = perfect uniform, 1 = fully collapsed
         diversity_loss = (max_entropy - entropy) / max_entropy
         return diversity_loss
 
@@ -301,9 +313,9 @@ class VectorQuantize(nn.Module):
         commitment_loss = F.mse_loss(x_flat.detach(), quantized_flat) \
             + self.commitment_weight * F.mse_loss(x_flat, quantized_flat.detach())
 
-        # Diversity loss (maximize codebook entropy)
+        # Diversity loss (maximize codebook entropy) - uses dists for gradient flow
         if self.training and self.diversity_weight > 0:
-            diversity_loss = self._compute_diversity_loss()
+            diversity_loss = self._compute_diversity_loss(dists)
             total_loss = commitment_loss + self.diversity_weight * diversity_loss
         else:
             total_loss = commitment_loss
@@ -321,8 +333,13 @@ class VectorQuantize(nn.Module):
 
     @torch.no_grad()
     def get_diversity_loss(self) -> torch.Tensor:
-        """Get current diversity loss value (for logging)."""
-        return self._compute_diversity_loss()
+        """Get current diversity loss value (for logging, no gradient)."""
+        # For logging only: use cluster_size as proxy
+        probs = self.cluster_size / (self.cluster_size.sum() + 1e-8)
+        probs = probs.clamp(min=1e-8)
+        entropy = -(probs * torch.log(probs)).sum()
+        max_entropy = math.log(self.codebook_size)
+        return (max_entropy - entropy) / max_entropy
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode codebook indices back to vectors.
