@@ -101,6 +101,7 @@ class UltraCodec(nn.Module):
         codes = quant_out['codes']
         commitment_loss = quant_out['commitment_loss']
         prediction_loss = quant_out['prediction_loss']
+        diversity_loss = quant_out.get('diversity_loss', None)
         residual_norms = quant_out['residual_norms']
 
         # 3. Adaptive Frame Rate gating
@@ -124,7 +125,7 @@ class UltraCodec(nn.Module):
         elif x_hat.size(2) > target_length:
             x_hat = x_hat[:, :, :target_length]
 
-        return {
+        result = {
             'x_hat': x_hat,
             'codes': codes,
             'commitment_loss': commitment_loss,
@@ -134,6 +135,9 @@ class UltraCodec(nn.Module):
             'rate_loss': rate_loss,
             'encoder_features': features,
         }
+        if diversity_loss is not None:
+            result['diversity_loss'] = diversity_loss
+        return result
 
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:

@@ -909,6 +909,7 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
                     _mel = partial.get("loss/mel", 0)
                     _time = partial.get("loss/time", 0)
                     _commit = partial.get("loss/commitment", 0)
+                    _diversity = outputs.get("diversity_loss", None)
                     parts_str = (
                         f"step={step}/{max_steps}"
                         f" | g_total={float(g_loss.detach()):.4f}"
@@ -917,6 +918,9 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
                         f" | time={float(_time):.3f}"
                         f" | commit={float(_commit):.3f}"
                     )
+                    if _diversity is not None:
+                        parts_str += f" | div={float(_diversity):.3f}"
+                        metrics["train/diversity_loss"] = float(_diversity)
                     if d_loss_value > 0:
                         parts_str += f" | d={d_loss_value:.4f}"
                     parts_str += f" | lr={g_opt.param_groups[0]['lr']:.2e}"

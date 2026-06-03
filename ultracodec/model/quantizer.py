@@ -5,10 +5,17 @@ reduce quantization redundancy. Instead of quantizing raw features,
 we quantize prediction residuals, leveraging temporal correlation.
 
 Key components:
-    - VectorQuantize: Standard VQ with EMA codebook updates
+    - VectorQuantize: Anti-collapse VQ with EMA codebook updates
     - ResidualVQ: Multi-codebook residual vector quantization
     - SemanticPredictor: Autoregressive predictor using Transformer
     - SPQ: Full semantic predictive quantization pipeline
+
+Anti-collapse mechanisms:
+    - Aggressive dead code reset (every 20 steps, dynamic threshold)
+    - Codebook diversity loss (maximize entropy of code distribution)
+    - Lower EMA decay (0.95) for faster adaptation
+    - Gumbel noise for early-stage exploration
+    - Periodic K-means reinit every 1000 steps
 """
 
 from __future__ import annotations
@@ -23,22 +30,26 @@ from einops import rearrange, repeat
 
 
 class VectorQuantize(nn.Module):
-    """Standard Vector Quantization with EMA codebook updates.
+    """Anti-collapse Vector Quantization with EMA codebook updates.
 
     Uses exponential moving average to update codebook entries during
     training, with straight-through estimator for gradient propagation.
-    Includes codebook reset for dead codes and optional L2 normalization.
+    Includes aggressive codebook reset, diversity loss, exploration noise,
+    and periodic K-means reinit to prevent codebook collapse.
 
     Args:
         dim: Input/codebook entry dimension.
         codebook_size: Number of codebook entries.
         commitment_weight: Weight for commitment loss.
-        decay: EMA decay rate for codebook update.
+        decay: EMA decay rate for codebook update (default 0.95).
         epsilon: Epsilon for numerical stability in EMA.
         codebook_reset: Whether to reset dead codebook entries.
         reset_every: How often (in steps) to check and reset dead codes.
-        reset_threshold: Codes with EMA usage below this are considered dead.
+        reset_threshold: Dynamic threshold factor (fraction of mean usage).
         normalize: Whether to L2 normalize inputs and codebook before distance.
+        diversity_weight: Weight for codebook diversity (entropy) loss.
+        noise_scale: Initial scale for Gumbel exploration noise.
+        kmeans_reinit_every: Steps between full K-means reinit (0=disabled).
     """
 
     def __init__(
@@ -46,12 +57,15 @@ class VectorQuantize(nn.Module):
         dim: int,
         codebook_size: int = 1024,
         commitment_weight: float = 0.25,
-        decay: float = 0.99,
+        decay: float = 0.95,
         epsilon: float = 1e-5,
         codebook_reset: bool = True,
-        reset_every: int = 100,
-        reset_threshold: float = 2.0,
+        reset_every: int = 20,
+        reset_threshold: float = 0.1,
         normalize: bool = True,
+        diversity_weight: float = 0.1,
+        noise_scale: float = 0.1,
+        kmeans_reinit_every: int = 1000,
     ):
         super().__init__()
         self.dim = dim
@@ -63,6 +77,9 @@ class VectorQuantize(nn.Module):
         self.reset_every = reset_every
         self.reset_threshold = reset_threshold
         self.normalize = normalize
+        self.diversity_weight = diversity_weight
+        self.noise_scale = noise_scale
+        self.kmeans_reinit_every = kmeans_reinit_every
 
         # Codebook
         self.embedding = nn.Embedding(codebook_size, dim)
@@ -90,22 +107,24 @@ class VectorQuantize(nn.Module):
             noise = torch.randn_like(expanded) * 0.01
             self.embedding.weight.data.copy_(expanded + noise)
         self.embed_avg.data.copy_(self.embedding.weight.data)
-        self.cluster_size.data.fill_(1.0 / self.codebook_size)
+        self.cluster_size.data.fill_(1.0)
         self.inited.fill_(True)
 
     def _maybe_reset_codes(self, flat_inputs: torch.Tensor) -> None:
-        """Reset dead codes by replacing them with random encoder outputs.
+        """Reset dead codes with dynamic threshold.
 
-        Dead codes are those with EMA cluster_size below the threshold.
-        They are replaced with randomly sampled encoder outputs from the
-        current batch to encourage better codebook utilization.
+        Dead codes are those with cluster_size < mean_usage * reset_threshold.
+        They are replaced with randomly sampled encoder outputs plus small
+        noise to avoid multiple dead codes collapsing to the same vector.
         """
         if not self.codebook_reset:
             return
         if self.steps % self.reset_every != 0:
             return
 
-        dead_mask = self.cluster_size < self.reset_threshold
+        # Dynamic threshold: codes used less than 10% of mean are dead
+        mean_usage = self.cluster_size.mean()
+        dead_mask = self.cluster_size < (mean_usage * self.reset_threshold)
         n_dead = dead_mask.sum().item()
         if n_dead == 0:
             return
@@ -114,10 +133,79 @@ class VectorQuantize(nn.Module):
         n_samples = flat_inputs.size(0)
         random_indices = torch.randint(0, n_samples, (n_dead,), device=flat_inputs.device)
         new_codes = flat_inputs[random_indices].detach().to(self.embedding.weight.dtype)
+
+        # Add small noise to each replacement to avoid duplicates
+        noise = torch.randn_like(new_codes) * 0.02
+        new_codes = new_codes + noise
+
         self.embedding.weight.data[dead_mask] = new_codes
-        # Reset EMA stats for revived codes
-        self.cluster_size[dead_mask] = 1.0
-        self.embed_avg.data[dead_mask] = new_codes
+        # Reset EMA stats for revived codes to mean level
+        self.cluster_size[dead_mask] = mean_usage
+        self.embed_avg.data[dead_mask] = new_codes * mean_usage
+
+    def _compute_diversity_loss(self) -> torch.Tensor:
+        """Compute diversity loss: encourages uniform codebook usage.
+
+        Returns normalized negative entropy of code distribution.
+        diversity_loss = (max_entropy - entropy) / max_entropy in [0, 1].
+        """
+        # Use cluster_size as proxy for code usage distribution
+        probs = self.cluster_size / (self.cluster_size.sum() + 1e-8)
+        # Clamp for numerical stability
+        probs = probs.clamp(min=1e-8)
+        entropy = -(probs * torch.log(probs)).sum()
+        max_entropy = math.log(self.codebook_size)
+        # Normalized so that 0 = perfect uniform, 1 = fully collapsed
+        diversity_loss = (max_entropy - entropy) / max_entropy
+        return diversity_loss
+
+    def _kmeans_reinit(self, data: torch.Tensor) -> None:
+        """Run mini K-means on encoder outputs to reinitialize codebook.
+
+        Uses 10 iterations of K-means on the provided data to find
+        better codebook centroids. Only updates codes that converge.
+        """
+        n = data.shape[0]
+        if n < self.codebook_size:
+            return  # Not enough data for K-means
+
+        # Subsample if too much data
+        max_samples = min(n, self.codebook_size * 32)
+        if n > max_samples:
+            indices = torch.randperm(n, device=data.device)[:max_samples]
+            data = data[indices]
+            n = max_samples
+
+        # Initialize centroids from data
+        init_indices = torch.randperm(n, device=data.device)[:self.codebook_size]
+        centroids = data[init_indices].clone()
+
+        # Run K-means iterations
+        for _ in range(10):
+            if self.normalize:
+                data_norm = F.normalize(data, p=2, dim=-1)
+                cent_norm = F.normalize(centroids, p=2, dim=-1)
+                dists = 2.0 - 2.0 * (data_norm @ cent_norm.t())
+            else:
+                dists = (
+                    data.pow(2).sum(dim=-1, keepdim=True)
+                    - 2 * data @ centroids.t()
+                    + centroids.pow(2).sum(dim=-1, keepdim=True).t()
+                )
+            assignments = dists.argmin(dim=-1)
+            one_hot = F.one_hot(assignments, self.codebook_size).float()
+            counts = one_hot.sum(dim=0)
+            new_centroids = one_hot.t() @ data
+
+            # Update only non-empty clusters
+            mask = counts > 0
+            if mask.any():
+                centroids[mask] = new_centroids[mask] / counts[mask].unsqueeze(1)
+
+        # Update codebook
+        self.embedding.weight.data.copy_(centroids.to(self.embedding.weight.dtype))
+        self.embed_avg.data.copy_(centroids.to(self.embed_avg.dtype))
+        self.cluster_size.data.fill_(1.0)
 
     def forward(
         self, x: torch.Tensor
@@ -131,7 +219,7 @@ class VectorQuantize(nn.Module):
             Tuple of:
                 - quantized: Quantized output (same shape as input)
                 - codes: Codebook indices [B*T] or [B, T]
-                - loss: Commitment + codebook loss
+                - loss: Commitment + diversity loss
         """
         need_reshape = x.dim() == 3
         if need_reshape:
@@ -149,6 +237,11 @@ class VectorQuantize(nn.Module):
             self._maybe_reset_codes(x_flat.detach())
             self.steps += 1
 
+        # Periodic K-means reinit
+        if self.training and self.kmeans_reinit_every > 0:
+            if self.steps > 0 and self.steps % self.kmeans_reinit_every == 0:
+                self._kmeans_reinit(x_flat.detach())
+
         # Compute distances with optional L2 normalization
         if self.normalize:
             x_norm = F.normalize(x_flat, p=2, dim=-1)
@@ -163,6 +256,14 @@ class VectorQuantize(nn.Module):
                 + self.embedding.weight.pow(2).sum(dim=-1, keepdim=True).t()
             )
 
+        # Add Gumbel noise for exploration (decays over training)
+        if self.training and self.noise_scale > 0:
+            # Noise decays linearly over the first 1000 steps
+            decay_factor = max(0.0, 1.0 - float(self.steps) / 1000.0)
+            if decay_factor > 0:
+                noise = torch.randn_like(dists) * self.noise_scale * decay_factor
+                dists = dists + noise
+
         # Find nearest codebook entry
         codes = dists.argmin(dim=-1)  # [B*T]
         quantized_flat = self.embedding(codes)  # [B*T, D]
@@ -172,7 +273,13 @@ class VectorQuantize(nn.Module):
             with torch.no_grad():
                 one_hot = F.one_hot(codes, self.codebook_size).float()  # [B*T, K]
                 new_cluster_size = one_hot.sum(dim=0)  # [K]
-                new_embed_sum = one_hot.t() @ x_flat.detach().float()  # [K, D] in fp32
+
+                # Use normalized vectors for EMA if normalize mode
+                if self.normalize:
+                    ema_input = F.normalize(x_flat.detach(), p=2, dim=-1).float()
+                else:
+                    ema_input = x_flat.detach().float()
+                new_embed_sum = one_hot.t() @ ema_input  # [K, D] in fp32
 
                 self.cluster_size.data.mul_(self.decay).add_(
                     new_cluster_size, alpha=1 - self.decay
@@ -194,6 +301,13 @@ class VectorQuantize(nn.Module):
         commitment_loss = F.mse_loss(x_flat.detach(), quantized_flat) \
             + self.commitment_weight * F.mse_loss(x_flat, quantized_flat.detach())
 
+        # Diversity loss (maximize codebook entropy)
+        if self.training and self.diversity_weight > 0:
+            diversity_loss = self._compute_diversity_loss()
+            total_loss = commitment_loss + self.diversity_weight * diversity_loss
+        else:
+            total_loss = commitment_loss
+
         # Straight-through estimator
         quantized_flat = x_flat + (quantized_flat - x_flat).detach()
 
@@ -203,7 +317,12 @@ class VectorQuantize(nn.Module):
         else:
             quantized = quantized_flat
 
-        return quantized, codes, commitment_loss
+        return quantized, codes, total_loss
+
+    @torch.no_grad()
+    def get_diversity_loss(self) -> torch.Tensor:
+        """Get current diversity loss value (for logging)."""
+        return self._compute_diversity_loss()
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode codebook indices back to vectors.
@@ -244,8 +363,11 @@ class ResidualVQ(nn.Module):
         decay: EMA decay rate for codebook update.
         codebook_reset: Whether to reset dead codebook entries.
         reset_every: How often (in steps) to check and reset dead codes.
-        reset_threshold: Codes with EMA usage below this are considered dead.
+        reset_threshold: Dynamic threshold factor for dead code detection.
         normalize: Whether to L2 normalize before distance computation.
+        diversity_weight: Weight for codebook diversity loss.
+        noise_scale: Initial scale for exploration noise.
+        kmeans_reinit_every: Steps between full K-means reinit.
     """
 
     def __init__(
@@ -255,11 +377,14 @@ class ResidualVQ(nn.Module):
         num_codebooks: int = 8,
         codebook_dim: Optional[int] = None,
         commitment_weight: float = 0.25,
-        decay: float = 0.99,
+        decay: float = 0.95,
         codebook_reset: bool = True,
-        reset_every: int = 100,
-        reset_threshold: float = 2.0,
+        reset_every: int = 20,
+        reset_threshold: float = 0.1,
         normalize: bool = True,
+        diversity_weight: float = 0.1,
+        noise_scale: float = 0.1,
+        kmeans_reinit_every: int = 1000,
     ):
         super().__init__()
         self.dim = dim
@@ -281,13 +406,16 @@ class ResidualVQ(nn.Module):
                 reset_every=reset_every,
                 reset_threshold=reset_threshold,
                 normalize=normalize,
+                diversity_weight=diversity_weight,
+                noise_scale=noise_scale,
+                kmeans_reinit_every=kmeans_reinit_every,
             )
             for _ in range(num_codebooks)
         ])
 
     def forward(
         self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass with residual quantization.
 
         Args:
@@ -297,7 +425,8 @@ class ResidualVQ(nn.Module):
             Tuple of:
                 - quantized: Sum of all quantized layers [B, D, T]
                 - codes: Codebook indices [B, num_codebooks, T]
-                - total_loss: Sum of all layer losses
+                - total_loss: Sum of all layer losses (commitment + diversity)
+                - diversity_loss: Sum of diversity losses across layers
         """
         B, D, T = x.shape
 
@@ -310,6 +439,7 @@ class ResidualVQ(nn.Module):
         quantized_sum = torch.zeros_like(x_proj)
         all_codes = []
         total_loss = torch.tensor(0.0, device=x.device)
+        diversity_loss_total = torch.tensor(0.0, device=x.device)
 
         for layer in self.layers:
             quantized, codes, loss = layer(residual)
@@ -317,6 +447,9 @@ class ResidualVQ(nn.Module):
             quantized_sum = quantized_sum + quantized
             all_codes.append(codes)
             total_loss = total_loss + loss
+            # Accumulate diversity loss for logging
+            if self.training:
+                diversity_loss_total = diversity_loss_total + layer.get_diversity_loss()
 
         # Project back to original dim
         quantized_out = rearrange(quantized_sum, 'b d t -> (b t) d')
@@ -324,7 +457,7 @@ class ResidualVQ(nn.Module):
         quantized_out = rearrange(quantized_out, '(b t) d -> b d t', b=B, t=T)
 
         codes = torch.stack(all_codes, dim=1)  # [B, num_codebooks, T]
-        return quantized_out, codes, total_loss
+        return quantized_out, codes, total_loss, diversity_loss_total
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode from codebook indices.
@@ -464,11 +597,14 @@ class SPQ(nn.Module):
         prediction_order: int = config.get('prediction_order', 2)
         predictor_layers: int = config.get('predictor_layers', 4)
         predictor_heads: int = config.get('predictor_heads', 8)
-        ema_decay: float = config.get('ema_decay', 0.99)
+        ema_decay: float = config.get('ema_decay', 0.95)
         codebook_reset: bool = config.get('codebook_reset', True)
-        reset_every: int = config.get('reset_every', 100)
-        reset_threshold: float = config.get('reset_threshold', 2.0)
+        reset_every: int = config.get('reset_every', 20)
+        reset_threshold: float = config.get('reset_threshold', 0.1)
         normalize: bool = config.get('normalize', True)
+        diversity_weight: float = config.get('diversity_weight', 0.1)
+        noise_scale: float = config.get('noise_scale', 0.1)
+        kmeans_reinit_every: int = config.get('kmeans_reinit_every', 1000)
 
         self.input_dim = input_dim
         self.codebook_dim = codebook_dim
@@ -495,6 +631,9 @@ class SPQ(nn.Module):
             reset_every=reset_every,
             reset_threshold=reset_threshold,
             normalize=normalize,
+            diversity_weight=diversity_weight,
+            noise_scale=noise_scale,
+            kmeans_reinit_every=kmeans_reinit_every,
         )
 
         # Post projection back to input_dim
@@ -512,8 +651,9 @@ class SPQ(nn.Module):
             Dictionary with:
                 - 'quantized': Reconstructed features [B, D, T]
                 - 'codes': Codebook indices [B, num_codebooks, T]
-                - 'commitment_loss': VQ commitment loss
+                - 'commitment_loss': VQ commitment + diversity loss
                 - 'prediction_loss': Prediction accuracy loss
+                - 'diversity_loss': Codebook diversity loss (for logging)
                 - 'residuals': Raw residuals before quantization [B, codebook_dim, T]
                 - 'residual_norms': Per-frame residual norms [B, T]
         """
@@ -533,8 +673,8 @@ class SPQ(nn.Module):
         # Compute residual norms (useful for AFR)
         residual_norms = residuals.norm(dim=1)  # [B, T]
 
-        # Quantize residuals
-        quantized_residuals, codes, commitment_loss = self.rvq(residuals)
+        # Quantize residuals (now returns 4 values)
+        quantized_residuals, codes, commitment_loss, diversity_loss = self.rvq(residuals)
 
         # Reconstruct: prediction + quantized residual
         reconstructed = predictions + quantized_residuals  # [B, codebook_dim, T]
@@ -552,6 +692,7 @@ class SPQ(nn.Module):
             'codes': codes,
             'commitment_loss': commitment_loss,
             'prediction_loss': prediction_loss,
+            'diversity_loss': diversity_loss,
             'residuals': residuals,
             'residual_norms': residual_norms,
         }
@@ -577,7 +718,7 @@ class SPQ(nn.Module):
         residuals = x_proj - predictions
 
         # Quantize residuals
-        _, codes, _ = self.rvq(residuals)
+        _, codes, _, _ = self.rvq(residuals)
         return codes
 
     def decode(self, codes: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
