@@ -181,6 +181,9 @@ class VectorQuantize(nn.Module):
         if n < self.codebook_size:
             return  # Not enough data for K-means
 
+        # Work in float32 for numerical stability and dtype consistency
+        data = data.float()
+
         # Subsample if too much data
         max_samples = min(n, self.codebook_size * 32)
         if n > max_samples:
