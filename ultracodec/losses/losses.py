@@ -111,8 +111,9 @@ class MultiResolutionSTFTLoss(nn.Module):
         for n_fft, hop, win in zip(self.fft_sizes, self.hop_sizes, self.win_sizes):
             s = _stft(x, n_fft, hop, win)
             s_hat = _stft(x_hat, n_fft, hop, win)
-            denom = torch.linalg.norm(s, ord="fro") + self.eps
-            sc = torch.linalg.norm(s - s_hat, ord="fro") / denom
+            # Spectral convergence: Frobenius norm on flattened spectrogram
+            denom = torch.norm(s) + self.eps
+            sc = torch.norm(s - s_hat) / denom
             mag = F.l1_loss(torch.log(s_hat + self.eps), torch.log(s + self.eps))
             sc_loss = sc_loss + sc
             mag_loss = mag_loss + mag
