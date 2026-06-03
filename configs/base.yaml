@@ -33,6 +33,11 @@ model:
     prediction_order: 2
     predictor_layers: 4
     predictor_heads: 8
+    ema_decay: 0.99                     # EMA decay for codebook update
+    codebook_reset: true                # Reset dead codebook entries
+    reset_every: 100                    # Check every 100 steps
+    reset_threshold: 2.0                # Reset codes with usage below this
+    normalize: true                     # L2 normalize before distance computation
 
   # Adaptive Frame Rate
   afr:

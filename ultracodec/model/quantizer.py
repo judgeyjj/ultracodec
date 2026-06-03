@@ -27,6 +27,7 @@ class VectorQuantize(nn.Module):
 
     Uses exponential moving average to update codebook entries during
     training, with straight-through estimator for gradient propagation.
+    Includes codebook reset for dead codes and optional L2 normalization.
 
     Args:
         dim: Input/codebook entry dimension.
@@ -34,6 +35,10 @@ class VectorQuantize(nn.Module):
         commitment_weight: Weight for commitment loss.
         decay: EMA decay rate for codebook update.
         epsilon: Epsilon for numerical stability in EMA.
+        codebook_reset: Whether to reset dead codebook entries.
+        reset_every: How often (in steps) to check and reset dead codes.
+        reset_threshold: Codes with EMA usage below this are considered dead.
+        normalize: Whether to L2 normalize inputs and codebook before distance.
     """
 
     def __init__(
@@ -43,6 +48,10 @@ class VectorQuantize(nn.Module):
         commitment_weight: float = 0.25,
         decay: float = 0.99,
         epsilon: float = 1e-5,
+        codebook_reset: bool = True,
+        reset_every: int = 100,
+        reset_threshold: float = 2.0,
+        normalize: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -50,6 +59,10 @@ class VectorQuantize(nn.Module):
         self.commitment_weight = commitment_weight
         self.decay = decay
         self.epsilon = epsilon
+        self.codebook_reset = codebook_reset
+        self.reset_every = reset_every
+        self.reset_threshold = reset_threshold
+        self.normalize = normalize
 
         # Codebook
         self.embedding = nn.Embedding(codebook_size, dim)
@@ -59,6 +72,7 @@ class VectorQuantize(nn.Module):
         self.register_buffer('cluster_size', torch.zeros(codebook_size))
         self.register_buffer('embed_avg', self.embedding.weight.data.clone())
         self.register_buffer('inited', torch.tensor(False))
+        self.register_buffer('steps', torch.tensor(0, dtype=torch.long))
 
     def _init_codebook(self, data: torch.Tensor) -> None:
         """Initialize codebook from first batch of data."""
@@ -78,6 +92,31 @@ class VectorQuantize(nn.Module):
         self.embed_avg.data.copy_(self.embedding.weight.data)
         self.cluster_size.data.fill_(1.0 / self.codebook_size)
         self.inited.fill_(True)
+
+    def _maybe_reset_codes(self, flat_inputs: torch.Tensor) -> None:
+        """Reset dead codes by replacing them with random encoder outputs.
+
+        Dead codes are those with EMA cluster_size below the threshold.
+        They are replaced with randomly sampled encoder outputs from the
+        current batch to encourage better codebook utilization.
+        """
+        if not self.codebook_reset:
+            return
+        if self.steps % self.reset_every != 0:
+            return
+
+        dead_mask = self.cluster_size < self.reset_threshold
+        n_dead = dead_mask.sum().item()
+        if n_dead == 0:
+            return
+
+        # Sample random encoder outputs as replacements
+        n_samples = flat_inputs.size(0)
+        random_indices = torch.randint(0, n_samples, (n_dead,), device=flat_inputs.device)
+        self.embedding.weight.data[dead_mask] = flat_inputs[random_indices].detach()
+        # Reset EMA stats for revived codes
+        self.cluster_size[dead_mask] = 1.0
+        self.embed_avg.data[dead_mask] = flat_inputs[random_indices].detach()
 
     def forward(
         self, x: torch.Tensor
@@ -104,12 +143,24 @@ class VectorQuantize(nn.Module):
         if self.training and not self.inited:
             self._init_codebook(x_flat.detach())
 
-        # Compute distances: ||x - e||^2 = ||x||^2 - 2*x*e^T + ||e||^2
-        dists = (
-            x_flat.pow(2).sum(dim=-1, keepdim=True)
-            - 2 * x_flat @ self.embedding.weight.t()
-            + self.embedding.weight.pow(2).sum(dim=-1, keepdim=True).t()
-        )
+        # Optionally reset dead codes before distance computation
+        if self.training:
+            self._maybe_reset_codes(x_flat.detach())
+            self.steps += 1
+
+        # Compute distances with optional L2 normalization
+        if self.normalize:
+            x_norm = F.normalize(x_flat, p=2, dim=-1)
+            cb_norm = F.normalize(self.embedding.weight, p=2, dim=-1)
+            # ||x_norm - cb_norm||^2 = 2 - 2 * x_norm @ cb_norm^T
+            dists = 2.0 - 2.0 * (x_norm @ cb_norm.t())
+        else:
+            # Compute distances: ||x - e||^2 = ||x||^2 - 2*x*e^T + ||e||^2
+            dists = (
+                x_flat.pow(2).sum(dim=-1, keepdim=True)
+                - 2 * x_flat @ self.embedding.weight.t()
+                + self.embedding.weight.pow(2).sum(dim=-1, keepdim=True).t()
+            )
 
         # Find nearest codebook entry
         codes = dists.argmin(dim=-1)  # [B*T]
@@ -189,6 +240,11 @@ class ResidualVQ(nn.Module):
         num_codebooks: Number of residual quantization layers.
         codebook_dim: Dimension of codebook entries (projects if != dim).
         commitment_weight: Commitment loss weight.
+        decay: EMA decay rate for codebook update.
+        codebook_reset: Whether to reset dead codebook entries.
+        reset_every: How often (in steps) to check and reset dead codes.
+        reset_threshold: Codes with EMA usage below this are considered dead.
+        normalize: Whether to L2 normalize before distance computation.
     """
 
     def __init__(
@@ -198,6 +254,11 @@ class ResidualVQ(nn.Module):
         num_codebooks: int = 8,
         codebook_dim: Optional[int] = None,
         commitment_weight: float = 0.25,
+        decay: float = 0.99,
+        codebook_reset: bool = True,
+        reset_every: int = 100,
+        reset_threshold: float = 2.0,
+        normalize: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -214,6 +275,11 @@ class ResidualVQ(nn.Module):
                 dim=self.codebook_dim,
                 codebook_size=codebook_size,
                 commitment_weight=commitment_weight,
+                decay=decay,
+                codebook_reset=codebook_reset,
+                reset_every=reset_every,
+                reset_threshold=reset_threshold,
+                normalize=normalize,
             )
             for _ in range(num_codebooks)
         ])
@@ -397,6 +463,11 @@ class SPQ(nn.Module):
         prediction_order: int = config.get('prediction_order', 2)
         predictor_layers: int = config.get('predictor_layers', 4)
         predictor_heads: int = config.get('predictor_heads', 8)
+        ema_decay: float = config.get('ema_decay', 0.99)
+        codebook_reset: bool = config.get('codebook_reset', True)
+        reset_every: int = config.get('reset_every', 100)
+        reset_threshold: float = config.get('reset_threshold', 2.0)
+        normalize: bool = config.get('normalize', True)
 
         self.input_dim = input_dim
         self.codebook_dim = codebook_dim
@@ -418,6 +489,11 @@ class SPQ(nn.Module):
             num_codebooks=num_codebooks,
             codebook_dim=codebook_dim,
             commitment_weight=commitment_weight,
+            decay=ema_decay,
+            codebook_reset=codebook_reset,
+            reset_every=reset_every,
+            reset_threshold=reset_threshold,
+            normalize=normalize,
         )
 
         # Post projection back to input_dim
