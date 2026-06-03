@@ -60,7 +60,7 @@ data:
 
   librispeech:
     root: ./data/librispeech
-    download: true
+    download: false                        # Set true only if data not present
     train_splits: [train-clean-100, train-clean-360]
     val_splits: [dev-clean]
     test_splits: [test-clean]
