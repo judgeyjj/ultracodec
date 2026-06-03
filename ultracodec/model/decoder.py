@@ -77,6 +77,7 @@ class UpsampleBlock(nn.Module):
         num_transformer_layers: Number of Transformer blocks for refinement.
         num_heads: Number of attention heads.
         use_skip: Whether to use skip connection from encoder.
+        skip_dim: Dimension of incoming skip features (if different from in_dim).
     """
 
     def __init__(
@@ -87,13 +88,14 @@ class UpsampleBlock(nn.Module):
         num_transformer_layers: int = 2,
         num_heads: int = 8,
         use_skip: bool = True,
+        skip_dim: Optional[int] = None,
     ):
         super().__init__()
         self.use_skip = use_skip
 
         # Skip connection projection (encoder feature might have different dim)
-        skip_dim = in_dim if use_skip else 0
-        self.skip_proj = nn.Conv1d(in_dim, in_dim, 1) if use_skip else None
+        actual_skip_dim = skip_dim if skip_dim is not None else in_dim
+        self.skip_proj = nn.Conv1d(actual_skip_dim, in_dim, 1) if use_skip else None
 
         # Upsampling via transposed convolution
         self.upsample = CausalTransposeConv1d(
@@ -160,6 +162,7 @@ class CoarseDecoder(nn.Module):
         hidden_dims: Hidden dimensions for each stage (reversed from encoder).
         upsample_ratios: Upsampling factors for each stage.
         num_transformer_layers: Transformer layers per stage.
+        skip_dims: Dimensions of skip features from encoder (one per stage).
     """
 
     def __init__(
@@ -168,12 +171,14 @@ class CoarseDecoder(nn.Module):
         hidden_dims: List[int],
         upsample_ratios: List[int],
         num_transformer_layers: int = 2,
+        skip_dims: Optional[List[int]] = None,
     ):
         super().__init__()
         self.num_stages = len(hidden_dims) - 1  # stages between consecutive dims
 
         self.stages = nn.ModuleList()
         for i in range(self.num_stages):
+            s_dim = skip_dims[i] if skip_dims is not None and i < len(skip_dims) else None
             self.stages.append(
                 UpsampleBlock(
                     in_dim=hidden_dims[i],
@@ -182,6 +187,7 @@ class CoarseDecoder(nn.Module):
                     num_transformer_layers=num_transformer_layers,
                     num_heads=min(8, hidden_dims[i + 1] // 32),
                     use_skip=True,
+                    skip_dim=s_dim,
                 )
             )
 
@@ -294,11 +300,29 @@ class CascadedDecoder(nn.Module):
 
         # If hidden_dims has same length as upsample_ratios, add output dim
         if len(hidden_dims) == len(upsample_ratios):
-            # Each stage maps from hidden_dims[i] to hidden_dims[i+1] with upsampling
-            # Build sequential stages
             dims = hidden_dims
         else:
             dims = hidden_dims
+
+        # Compute skip dims from encoder_dims.
+        # Encoder features = [frontend_out, stage0_out, stage1_out, ..., stageN_out]
+        # Decoder gets reversed(features[:-1]) as skips.
+        # With encoder hidden_dims=[64,128,256,512]:
+        #   features = [64-dim, 64-dim, 128-dim, 256-dim, 512-dim]
+        #   skip_features = reversed(features[:-1]) = [256, 128, 64, 64]
+        skip_dims = None
+        if encoder_dims is not None:
+            # Encoder features list: [frontend_dim, stage0_out, stage1_out, ...]
+            # frontend_dim = encoder_dims[0]
+            # stage i out = encoder_dims[i] (for i=0 it's same as frontend)
+            # Full features list dims: [enc[0]] + [enc[0], enc[1], enc[2], enc[3]]
+            # Actually: features = [frontend=enc[0], stage0_out=enc[0], stage1_out=enc[1], stage2_out=enc[2], stage3_out=enc[3]]
+            # Skip = reversed(features[:-1]) = [enc[2], enc[1], enc[0], enc[0]]
+            enc_feature_dims = [encoder_dims[0]]  # frontend output
+            for i in range(len(encoder_dims)):
+                enc_feature_dims.append(encoder_dims[i])
+            # features[:-1] then reversed
+            skip_dims = list(reversed(enc_feature_dims[:-1]))
 
         # Coarse decoder stages (3.125Hz → 50Hz)
         self.coarse = CoarseDecoder(
@@ -306,6 +330,7 @@ class CascadedDecoder(nn.Module):
             hidden_dims=dims,
             upsample_ratios=upsample_ratios,
             num_transformer_layers=num_transformer_layers,
+            skip_dims=skip_dims,
         )
 
         # Fine decoder (50Hz → 16kHz waveform)
