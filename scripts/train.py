@@ -44,12 +44,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -418,6 +421,22 @@ def reduce_scalar(value: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+def compute_codebook_usage(codes: torch.Tensor, codebook_size: int = 1024) -> float:
+    """Compute codebook utilisation percentage.
+
+    Args:
+        codes: Long tensor ``[B, num_codebooks, T]``.
+        codebook_size: Total entries per codebook.
+
+    Returns:
+        Percentage of unique codes used across all codebooks.
+    """
+    unique_codes: set = set()
+    for cb_idx in range(codes.size(1)):
+        unique_codes.update(codes[:, cb_idx, :].reshape(-1).unique().tolist())
+    return len(unique_codes) / codebook_size * 100.0
+
+
 def run_validation(
     generator: nn.Module,
     val_loader: Optional[DataLoader],
@@ -426,12 +445,43 @@ def run_validation(
     amp_dtype: torch.dtype,
     use_amp: bool,
     max_batches: int = 50,
+    sample_rate: int = 16000,
 ) -> Dict[str, float]:
+    """Run validation with SOTA-aligned metrics (PESQ/STOI/SI-SDR/MCD/LSD/bitrate/cb_usage)."""
     if val_loader is None:
         return {}
+
+    from ultracodec.metrics.evaluation import MetricCalculator
+
     generator.eval()
     meter_total = AverageMeter("val/total")
     meter_recon = AverageMeter("val/recon")
+
+    # Metric accumulators
+    pesq_vals: list = []
+    stoi_vals: list = []
+    si_sdr_vals: list = []
+    mcd_vals: list = []
+    lsd_vals: list = []
+    bitrate_vals: list = []
+    frame_rate_vals: list = []
+    cb_usage_vals: list = []
+    utmos_vals: list = []
+
+    metric_calc = MetricCalculator(
+        sample_rate=sample_rate,
+        device=str(device),
+        enable_utmos=True,
+        enable_whisper=False,  # WER too slow for routine validation
+    )
+
+    # Get codebook size from model config if accessible
+    _gen = generator.module if hasattr(generator, 'module') else generator
+    codebook_size = 1024
+    if hasattr(_gen, 'config'):
+        _q_cfg = _gen.config.get('quantizer', {}) if hasattr(_gen.config, 'get') else {}
+        codebook_size = int(_q_cfg.get('codebook_size', 1024)) if hasattr(_q_cfg, 'get') else 1024
+
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
             if i >= max_batches:
@@ -452,8 +502,138 @@ def run_validation(
             recon = partial.get("loss/recon")
             if recon is not None:
                 meter_recon.update(float(recon))
+
+            # --- Per-sample metrics ---
+            x_hat = outputs["x_hat"]
+            if x_hat.dim() == 3:
+                x_hat = x_hat.squeeze(1)  # [B, T]
+            wav_2d = wav.squeeze(1) if wav.dim() == 3 else wav  # [B, T]
+
+            # Iterate over batch samples
+            batch_size = x_hat.size(0)
+            for b_idx in range(batch_size):
+                ref_np = wav_2d[b_idx].cpu().float().numpy()
+                deg_np = x_hat[b_idx].cpu().float().numpy()
+
+                # PESQ
+                try:
+                    val = metric_calc.compute_pesq(ref_np, deg_np, sample_rate)
+                    if not math.isnan(val):
+                        pesq_vals.append(val)
+                except Exception:
+                    pass
+
+                # STOI
+                try:
+                    val = metric_calc.compute_stoi(ref_np, deg_np, sample_rate)
+                    if not math.isnan(val):
+                        stoi_vals.append(val)
+                except Exception:
+                    pass
+
+                # SI-SDR
+                try:
+                    val = metric_calc.compute_si_sdr(ref_np, deg_np)
+                    if not math.isnan(val):
+                        si_sdr_vals.append(val)
+                except Exception:
+                    pass
+
+                # MCD
+                try:
+                    val = metric_calc.compute_mcd(ref_np, deg_np, sample_rate)
+                    if not math.isnan(val):
+                        mcd_vals.append(val)
+                except Exception:
+                    pass
+
+                # LSD
+                try:
+                    val = metric_calc.compute_lsd(ref_np, deg_np, sample_rate)
+                    if not math.isnan(val):
+                        lsd_vals.append(val)
+                except Exception:
+                    pass
+
+                # UTMOS (optional, may not be available)
+                try:
+                    val = metric_calc.compute_utmos(deg_np, sample_rate)
+                    if not math.isnan(val):
+                        utmos_vals.append(val)
+                except Exception:
+                    pass
+
+            # --- Codebook usage ---
+            codes = outputs.get("codes")
+            if codes is not None:
+                try:
+                    cb_usage_vals.append(compute_codebook_usage(codes, codebook_size))
+                except Exception:
+                    pass
+
+            # --- Bitrate & frame rate ---
+            if codes is not None:
+                try:
+                    gate = outputs.get("gate_decisions") or outputs.get("gate")
+                    audio_seconds = wav.shape[-1] / float(sample_rate)
+                    num_codebooks = codes.size(1)
+                    seq_len = codes.size(2)
+                    bits_per_code = math.log2(codebook_size)
+                    if gate is not None:
+                        effective = (gate > 0.5).float().sum(dim=-1).mean().item()
+                    else:
+                        effective = float(seq_len)
+                    total_bits = effective * num_codebooks * bits_per_code
+                    bitrate_vals.append(total_bits / (audio_seconds * 1000.0))
+                    frame_rate_vals.append(effective / audio_seconds)
+                except Exception:
+                    pass
+
     generator.train()
-    return {"val/total": meter_total.avg, "val/recon": meter_recon.avg}
+
+    # Aggregate results
+    results: Dict[str, float] = {
+        "val/total": meter_total.avg,
+        "val/recon": meter_recon.avg,
+    }
+    if pesq_vals:
+        results["val/pesq"] = float(np.mean(pesq_vals))
+    else:
+        results["val/pesq"] = float("nan")
+    if stoi_vals:
+        results["val/stoi"] = float(np.mean(stoi_vals))
+    else:
+        results["val/stoi"] = float("nan")
+    if si_sdr_vals:
+        results["val/si_sdr"] = float(np.mean(si_sdr_vals))
+    else:
+        results["val/si_sdr"] = float("nan")
+    if mcd_vals:
+        results["val/mcd"] = float(np.mean(mcd_vals))
+    else:
+        results["val/mcd"] = float("nan")
+    if lsd_vals:
+        results["val/lsd"] = float(np.mean(lsd_vals))
+    else:
+        results["val/lsd"] = float("nan")
+    if bitrate_vals:
+        results["val/bitrate"] = float(np.mean(bitrate_vals))
+    else:
+        results["val/bitrate"] = float("nan")
+    if frame_rate_vals:
+        results["val/frame_rate"] = float(np.mean(frame_rate_vals))
+    else:
+        results["val/frame_rate"] = float("nan")
+    if cb_usage_vals:
+        results["val/cb_usage"] = float(np.mean(cb_usage_vals))
+    else:
+        results["val/cb_usage"] = float("nan")
+    if utmos_vals:
+        results["val/utmos"] = float(np.mean(utmos_vals))
+    else:
+        results["val/utmos"] = float("nan")
+
+    return results
 
 
 def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
@@ -529,8 +709,8 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
 
     # AMP setup.
     use_amp, amp_dtype = resolve_amp(str(cfg.training.get("precision", "fp32")), device)
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
-    d_scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
+    d_scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
 
     # Loss.
     loss_fn = UltraCodecLoss(cfg).to(device)
@@ -592,7 +772,9 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
     save_every = int(cfg.training.checkpoint.save_every)
     keep_last = int(cfg.training.checkpoint.get("keep_last", 5))
     log_every = int(cfg.training.logging.log_every)
-    val_every = int(cfg.training.get("val_every", max(save_every, 1)))
+    _val_cfg = cfg.training.get("validation", {})
+    val_every = int(_val_cfg.get("val_every", cfg.training.get("val_every", max(save_every, 1))))
+    val_num_samples = int(_val_cfg.get("num_val_samples", 50))
     accum = max(1, int(cfg.training.get("accumulate_grad", 1)))
     grad_clip = float(cfg.training.get("gradient_clip", 1.0))
     adv_weight = float(cfg.training.get("losses", {}).get("adversarial_weight", 0.0))
@@ -722,15 +904,23 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
                         except Exception:
                             pass
                     train_logger.log(metrics, step)
-                    logger.info(
-                        "epoch=%d step=%d/%d g=%.4f d=%.4f lr=%.2e",
-                        epoch,
-                        step,
-                        max_steps,
-                        metrics["train/total"],
-                        d_loss_value,
-                        metrics["train/lr_g"],
+                    # Rich training log with sub-loss breakdown
+                    _stft = partial.get("loss/stft_sc", 0) + partial.get("loss/stft_mag", 0)
+                    _mel = partial.get("loss/mel", 0)
+                    _time = partial.get("loss/time", 0)
+                    _commit = partial.get("loss/commitment", 0)
+                    parts_str = (
+                        f"step={step}/{max_steps}"
+                        f" | g_total={float(g_loss.detach()):.4f}"
+                        f" | stft={float(_stft):.3f}"
+                        f" | mel={float(_mel):.3f}"
+                        f" | time={float(_time):.3f}"
+                        f" | commit={float(_commit):.3f}"
                     )
+                    if d_loss_value > 0:
+                        parts_str += f" | d={d_loss_value:.4f}"
+                    parts_str += f" | lr={g_opt.param_groups[0]['lr']:.2e}"
+                    logger.info(parts_str)
 
                 # ----- Validation -----
                 if val_every > 0 and step > 0 and step % val_every == 0 and is_main_process():
@@ -742,16 +932,34 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
                         device,
                         amp_dtype,
                         use_amp,
+                        max_batches=val_num_samples,
+                        sample_rate=int(cfg.data.sample_rate),
                     )
                     ema.restore(_gen_module())
                     if val_metrics:
                         train_logger.log(val_metrics, step)
-                        logger.info(
-                            "VAL step=%d total=%.4f recon=%.4f",
-                            step,
-                            val_metrics.get("val/total", float("nan")),
-                            val_metrics.get("val/recon", float("nan")),
-                        )
+                        # Rich validation log
+                        _vlog = f"VAL step={step}"
+                        _vlog += f" | recon={val_metrics.get('val/recon', float('nan')):.4f}"
+                        if not math.isnan(val_metrics.get('val/pesq', float('nan'))):
+                            _vlog += f" | PESQ={val_metrics['val/pesq']:.2f}"
+                        if not math.isnan(val_metrics.get('val/stoi', float('nan'))):
+                            _vlog += f" | STOI={val_metrics['val/stoi']:.3f}"
+                        if not math.isnan(val_metrics.get('val/si_sdr', float('nan'))):
+                            _vlog += f" | SI-SDR={val_metrics['val/si_sdr']:.1f}dB"
+                        if not math.isnan(val_metrics.get('val/mcd', float('nan'))):
+                            _vlog += f" | MCD={val_metrics['val/mcd']:.1f}"
+                        if not math.isnan(val_metrics.get('val/lsd', float('nan'))):
+                            _vlog += f" | LSD={val_metrics['val/lsd']:.2f}"
+                        if not math.isnan(val_metrics.get('val/bitrate', float('nan'))):
+                            _vlog += f" | bitrate={val_metrics['val/bitrate']:.1f}kbps"
+                        if not math.isnan(val_metrics.get('val/frame_rate', float('nan'))):
+                            _vlog += f" | frame_rate={val_metrics['val/frame_rate']:.1f}Hz"
+                        if not math.isnan(val_metrics.get('val/cb_usage', float('nan'))):
+                            _vlog += f" | cb_usage={val_metrics['val/cb_usage']:.1f}%"
+                        if not math.isnan(val_metrics.get('val/utmos', float('nan'))):
+                            _vlog += f" | UTMOS={val_metrics['val/utmos']:.2f}"
+                        logger.info(_vlog)
                         cur = val_metrics.get("val/total", float("inf"))
                         if cur < best_val:
                             best_val = cur
@@ -827,7 +1035,7 @@ def _save(
     d_opt: Optional[torch.optim.Optimizer],
     d_sched: Any,
     ema: EMA,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: Any,
     step: int,
     cfg: DictConfig,
 ) -> None:
