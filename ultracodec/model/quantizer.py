@@ -113,10 +113,11 @@ class VectorQuantize(nn.Module):
         # Sample random encoder outputs as replacements
         n_samples = flat_inputs.size(0)
         random_indices = torch.randint(0, n_samples, (n_dead,), device=flat_inputs.device)
-        self.embedding.weight.data[dead_mask] = flat_inputs[random_indices].detach()
+        new_codes = flat_inputs[random_indices].detach().to(self.embedding.weight.dtype)
+        self.embedding.weight.data[dead_mask] = new_codes
         # Reset EMA stats for revived codes
         self.cluster_size[dead_mask] = 1.0
-        self.embed_avg.data[dead_mask] = flat_inputs[random_indices].detach()
+        self.embed_avg.data[dead_mask] = new_codes
 
     def forward(
         self, x: torch.Tensor
@@ -171,7 +172,7 @@ class VectorQuantize(nn.Module):
             with torch.no_grad():
                 one_hot = F.one_hot(codes, self.codebook_size).float()  # [B*T, K]
                 new_cluster_size = one_hot.sum(dim=0)  # [K]
-                new_embed_sum = one_hot.t() @ x_flat.detach()  # [K, D]
+                new_embed_sum = one_hot.t() @ x_flat.detach().float()  # [K, D] in fp32
 
                 self.cluster_size.data.mul_(self.decay).add_(
                     new_cluster_size, alpha=1 - self.decay
