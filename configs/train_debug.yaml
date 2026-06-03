@@ -6,7 +6,7 @@ defaults:
 training:
   stage: 1
   description: "Quick validation run (small data, short training)"
-  batch_size: 8
+  batch_size: 16                 # Larger batch helps codebook utilization
   epochs: 5
   learning_rate: 3.0e-4
   weight_decay: 0.01

@@ -29,18 +29,18 @@ model:
     codebook_size: 1024
     codebook_dim: 128
     num_codebooks: 8
-    commitment_weight: 0.25
+    commitment_weight: 0.1              # Lower to give encoder freedom to explore
     prediction_order: 2
     predictor_layers: 4
     predictor_heads: 8
     ema_decay: 0.95                     # Lower for faster adaptation
     codebook_reset: true                # Reset dead codebook entries
-    reset_every: 20                     # Much more frequent reset check
+    reset_every: 20                     # Frequent reset check
     reset_threshold: 0.1                # Dynamic: 10% of mean usage
     normalize: true                     # L2 normalize before distance computation
-    diversity_weight: 0.1               # Weight for codebook diversity loss
-    noise_scale: 0.1                    # Gumbel noise for exploration
-    kmeans_reinit_every: 1000           # Periodic full K-means reinit
+    diversity_weight: 2.0               # HIGH weight to force codebook utilization
+    noise_scale: 0.3                    # Stronger noise for exploration
+    kmeans_reinit_every: 500            # More frequent K-means reinit
 
   # Adaptive Frame Rate
   afr:
