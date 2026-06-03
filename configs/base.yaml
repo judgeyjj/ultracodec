@@ -60,7 +60,7 @@ model:
 data:
   sample_rate: 16000
   segment_length: 48000                 # 3 seconds
-  num_workers: 8
+  num_workers: 32                      # High worker count for large batch
 
   vctk:
     root: /data01/audio_group/m24_yuanjiajun/AP-BWE/VCTK-Corpus-0.92/wav_test

@@ -279,6 +279,7 @@ def build_dataloader(
         pin_memory=True,
         drop_last=drop_last,
         persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
 
