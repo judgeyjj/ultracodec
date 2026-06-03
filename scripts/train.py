@@ -191,38 +191,44 @@ def build_train_dataset(cfg: DictConfig):
     data_cfg = cfg.data
     aug_enabled = bool(getattr(data_cfg.get("augmentation", {}), "enabled", False))
 
-    vctk_root = Path(data_cfg.vctk.root)
-    if vctk_root.exists():
-        parts.append(
-            VCTKDataset(
-                root_dir=vctk_root,
-                split="train",
-                sample_rate=data_cfg.sample_rate,
-                segment_length=data_cfg.segment_length,
-                augment=aug_enabled,
-            )
-        )
-    else:
-        logger.warning("VCTK root %s missing; skipping VCTK in training set.", vctk_root)
+    # Support use_datasets filter (e.g. [vctk] for quick debug)
+    use_datasets = list(cfg.training.get("use_datasets", ["vctk", "librispeech"]))
 
-    ls_cfg = data_cfg.librispeech
-    for split in ls_cfg.train_splits:
-        parts.append(
-            LibriSpeechDataset(
-                root_dir=ls_cfg.root,
-                split=split,
-                download=bool(ls_cfg.get("download", True)),
-                sample_rate=data_cfg.sample_rate,
-                segment_length=data_cfg.segment_length,
-                augment=aug_enabled,
+    if "vctk" in use_datasets:
+        vctk_root = Path(data_cfg.vctk.root)
+        if vctk_root.exists():
+            parts.append(
+                VCTKDataset(
+                    root_dir=vctk_root,
+                    split="train",
+                    sample_rate=data_cfg.sample_rate,
+                    segment_length=data_cfg.segment_length,
+                    augment=aug_enabled,
+                )
             )
-        )
+        else:
+            logger.warning("VCTK root %s missing; skipping VCTK in training set.", vctk_root)
+
+    if "librispeech" in use_datasets:
+        ls_cfg = data_cfg.librispeech
+        for split in ls_cfg.train_splits:
+            parts.append(
+                LibriSpeechDataset(
+                    root_dir=ls_cfg.root,
+                    split=split,
+                    download=bool(ls_cfg.get("download", False)),
+                    sample_rate=data_cfg.sample_rate,
+                    segment_length=data_cfg.segment_length,
+                    augment=aug_enabled,
+                )
+            )
 
     if not parts:
         raise RuntimeError(
             "No training datasets available. Verify `data.vctk.root` and "
-            "`data.librispeech.root` in your config."
+            "`data.librispeech.root` in your config, or check `training.use_datasets`."
         )
+    logger.info("Training datasets: %s (%d total parts)", use_datasets, len(parts))
     return MixedDataset(parts)
 
 

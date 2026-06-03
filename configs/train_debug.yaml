@@ -1,0 +1,48 @@
+# Stage 1 Quick Validation: Small data, short training to verify idea works.
+# Usage: CUDA_VISIBLE_DEVICES=2 python scripts/train.py --config configs/train_debug.yaml
+defaults:
+  - base
+
+training:
+  stage: 1
+  description: "Quick validation run (small data, short training)"
+  batch_size: 8
+  epochs: 5
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  scheduler: cosine_warmup
+  warmup_steps: 200
+  gradient_clip: 1.0
+  accumulate_grad: 1              # No accumulation for speed
+  max_steps: 2000                 # Only 2000 steps (~30min on A100)
+  precision: bf16
+
+  # Only use VCTK (small, local, fast)
+  use_datasets: [vctk]            # Skip LibriSpeech for now
+
+  losses:
+    reconstruction_weight: 1.0
+    adversarial_weight: 0.0
+    codebook_weight: 1.0
+    prediction_weight: 0.5
+    semantic_weight: 1.0
+    rate_weight: 10.0
+    llm_weight: 0.0
+
+  afr:
+    enabled: false
+
+  checkpoint:
+    save_every: 500
+    keep_last: 3
+    output_dir: runs/uc_debug
+
+  logging:
+    log_every: 10                  # Log more frequently for debugging
+    use_wandb: false               # No wandb for quick test
+    project: ultracodec
+    run_name: debug
+
+  validation:
+    val_every: 200                 # Validate every 200 steps
+    num_val_samples: 20            # Only validate on 20 samples
