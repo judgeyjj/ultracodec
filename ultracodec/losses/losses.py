@@ -40,6 +40,10 @@ def _stft(
     """
     if wav.dim() == 3:
         wav = wav.squeeze(1)
+    # cuFFT doesn't support BFloat16, cast to float32 for STFT
+    input_dtype = wav.dtype
+    if wav.dtype == torch.bfloat16 or wav.dtype == torch.float16:
+        wav = wav.float()
     window = torch.hann_window(win_length, device=wav.device, dtype=wav.dtype)
     spec = torch.stft(
         wav,
@@ -52,7 +56,11 @@ def _stft(
         normalized=False,
         return_complex=True,
     )
-    return spec.abs()
+    mag = spec.abs()
+    # Cast back to original dtype
+    if input_dtype != mag.dtype:
+        mag = mag.to(input_dtype)
+    return mag
 
 
 class MultiResolutionSTFTLoss(nn.Module):
