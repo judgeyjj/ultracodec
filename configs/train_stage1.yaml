@@ -5,14 +5,14 @@ defaults:
 training:
   stage: 1
   description: "Basic reconstruction training"
-  batch_size: 32                # Single A100 42GB has plenty of room
+  batch_size: 128               # A100 42GB only using 2GB, maximize GPU util
   epochs: 100
   learning_rate: 3.0e-4
   weight_decay: 0.01
   scheduler: cosine_warmup
   warmup_steps: 5000
   gradient_clip: 1.0
-  accumulate_grad: 4            # effective batch = 32 * 4 = 128
+  accumulate_grad: 1             # No accumulation needed with large batch
   max_steps: 200000
   precision: bf16
 
