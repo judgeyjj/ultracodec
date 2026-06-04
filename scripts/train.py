@@ -790,6 +790,14 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
     if is_main_process():
         logger.info("=== Starting training ===")
 
+    # tqdm progress bar
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(total=max_steps, initial=step, desc="Training", unit="step",
+                    dynamic_ncols=True) if is_main_process() else None
+    except ImportError:
+        pbar = None
+
     generator.train()
     if discriminator is not None:
         discriminator.train()
@@ -889,6 +897,11 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
                 ema.update(_gen_module())
 
                 step += 1
+
+                # ----- tqdm update -----
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(loss=f"{float(g_loss.detach()):.2f}", lr=f"{g_opt.param_groups[0]['lr']:.1e}", refresh=False)
 
                 # ----- Logging -----
                 if is_main_process() and step % log_every == 0:
@@ -1028,6 +1041,8 @@ def train(cfg: DictConfig, resume: Optional[str] = None) -> None:
         logger.info("Training finished at step %d. Final ckpt -> %s", step, final_path)
 
     train_logger.close()
+    if pbar is not None:
+        pbar.close()
     cleanup_distributed()
 
 
