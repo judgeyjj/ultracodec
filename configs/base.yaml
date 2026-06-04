@@ -38,9 +38,9 @@ model:
     reset_every: 20                     # Frequent reset check
     reset_threshold: 0.1                # Dynamic: 10% of mean usage
     normalize: true                     # L2 normalize before distance computation
-    diversity_weight: 2.0               # HIGH weight to force codebook utilization
-    noise_scale: 0.3                    # Stronger noise for exploration
-    kmeans_reinit_every: 500            # More frequent K-means reinit
+    diversity_weight: 0.5               # Reduced from 2.0 to prevent loss instability
+    noise_scale: 0.1                    # Reduced noise for training stability
+    kmeans_reinit_every: 0              # Disabled: causes loss spikes at reinit boundaries
 
   # Adaptive Frame Rate
   afr:

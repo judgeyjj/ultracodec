@@ -567,6 +567,11 @@ class UltraCodecLoss(nn.Module):
                 total = total + self.w_fm * fm
                 partial["loss/feature_match"] = fm.detach()
 
+        # Safety clamp: total loss should never be negative
+        if total < 0:
+            logger.warning("Loss went negative (%.4f), clamping to 0. Check diversity/commitment balance.", float(total))
+            total = total.clamp(min=0.0)
+
         partial["loss/total"] = total.detach()
         if "keep_ratio" in outputs and outputs["keep_ratio"] is not None:
             try:
