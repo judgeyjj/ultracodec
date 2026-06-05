@@ -29,18 +29,18 @@ model:
     codebook_size: 1024
     codebook_dim: 128
     num_codebooks: 8
-    commitment_weight: 0.1              # Lower to give encoder freedom to explore
+    commitment_weight: 0.25             # Standard VQ commitment
     prediction_order: 2
     predictor_layers: 4
     predictor_heads: 8
-    ema_decay: 0.95                     # Lower for faster adaptation
+    ema_decay: 0.99                     # Standard EMA decay
     codebook_reset: true                # Reset dead codebook entries
-    reset_every: 20                     # Frequent reset check
+    reset_every: 100                    # Check every 100 steps
     reset_threshold: 0.1                # Dynamic: 10% of mean usage
-    normalize: true                     # L2 normalize before distance computation
-    diversity_weight: 0.5               # Reduced from 2.0 to prevent loss instability
-    noise_scale: 0.1                    # Reduced noise for training stability
-    kmeans_reinit_every: 0              # Disabled: causes loss spikes at reinit boundaries
+    normalize: false                    # Disable: was causing issues with EMA
+    diversity_weight: 0.0               # Disabled: was causing negative loss
+    noise_scale: 0.0                    # Disabled: rely on dead code reset only
+    kmeans_reinit_every: 0              # Disabled
 
   # Adaptive Frame Rate
   afr:
