@@ -11,11 +11,14 @@ from the OmegaConf training config.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
