@@ -570,10 +570,17 @@ class UltraCodecLoss(nn.Module):
                 total = total + self.w_fm * fm
                 partial["loss/feature_match"] = fm.detach()
 
-        # Safety clamp: total loss should never be negative
+        # Safety: if total goes negative, log diagnostics and use only recon
         if total < 0:
-            logger.warning("Loss went negative (%.4f), clamping to 0. Check diversity/commitment balance.", float(total))
-            total = total.clamp(min=0.0)
+            diag_parts = [f"recon={float(recon):.4f}"]
+            if commit is not None:
+                diag_parts.append(f"commit={float(commit):.4f}")
+            if prediction is not None:
+                diag_parts.append(f"pred={float(prediction):.4f}")
+            logger.warning("Loss negative (%.4f). %s | Using recon only.",
+                          float(total), ", ".join(diag_parts))
+            # Fall back to pure recon loss (always positive)
+            total = self.w_recon * recon
 
         partial["loss/total"] = total.detach()
         if "keep_ratio" in outputs and outputs["keep_ratio"] is not None:
